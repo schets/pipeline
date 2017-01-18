@@ -1,6 +1,6 @@
 use std::cell::Cell;
 use std::ptr;
-use std::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicPtr, AtomicUsize, Ordering, fence};
 
 use util::maybe_acquire::{MAYBE_ACQUIRE, maybe_acquire_fence};
 use util::consume::Consume;
@@ -25,6 +25,7 @@ pub struct Reader {
 /// This represents the reader attempt at loading a transaction
 struct ReadAttempt<'a> {
     linked: Transaction<'a>,
+    reader: &'a Reader,
     state: ReaderState,
 }
 
@@ -33,7 +34,7 @@ struct ReaderGroup {
     // These pointers don't need ordering since they
     // are constant for a given ReaderGroup ptr
     readers: * const * const Reader,
-    n_readers: usize,
+    n_readers: isize,
 }
 
 #[repr(C)]
@@ -53,16 +54,30 @@ impl<'a> ReadAttempt<'a> {
         self.linked.get_wraps()
     }
 
-
     #[inline(always)]
-    pub fn commit_attempt(&self, by: u16, ord: Ordering) -> Option<ReadAttempt<'a>> {
+    pub fn commit_attempt(self, by: u16, ord: Ordering) -> Option<ReadAttempt<'a>> {
         match self.state {
-            Single => {
+            ReaderState::Single => {
                 self.linked.commit_direct(by, ord);
                 None
             },
-            Multi => {
-                self.linked.commit(by, ord)
+            ReaderState::Multi => {
+                if self.reader.num_consumers.load(Ordering::Relaxed) == 1 {
+                    fence(Ordering::Acquire);
+                    self.reader.state.set(ReaderState::Single);
+                    self.linked.commit_direct(by, ord);
+                    None
+                }
+                else {
+                    match self.linked.commit(by, ord) {
+                        Some(transaction) => Some(ReadAttempt {
+                            linked: transaction,
+                            reader: self.reader,
+                            state: ReaderState::Multi,
+                            }),
+                        None => None,
+                   } 
+               }
             }
         }
     }
@@ -73,6 +88,7 @@ impl Reader {
     pub fn load_attempt(&self, ord: Ordering) -> ReadAttempt {
         ReadAttempt {
             linked: self.pos_data.load_transaction(ord),
+            reader: self,
             state: self.state.get(),
         }
     }
@@ -93,7 +109,7 @@ impl ReaderGroup {
                 // If a reader has passed the writer during this function call
                 // then what must have happened is that somebody else has completed this
                 // and we should instead retry (and reload the global ctr)
-                let rpos = (**self.ptrs.offset(i)).pos_data.load_count(MAYBE_ACQUIRE);
+                let rpos = (**self.readers.offset(i)).pos_data.load_count(MAYBE_ACQUIRE);
                 let diff = cur_writer.wrapping_sub(rpos);
                 if diff > (::std::u16::MAX as usize) {
                     return None

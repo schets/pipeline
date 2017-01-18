@@ -42,6 +42,20 @@ impl CountedU16 {
             wrap: self.wrap,
         }
     }
+
+    #[inline(always)]
+    pub fn get_previous(&self, by: u16) -> usize {
+        let vals = self.val.load(Ordering::Relaxed);
+        let lower_half = vals as u16;
+        let upper_half = vals & !(::std::u16::MAX as usize);
+        if by <= lower_half {
+            ((lower_half - by) as usize) + upper_half
+        }
+        else {
+            let extra = (by - lower_half) as usize;
+            (self.wrap - extra) + (upper_half - (1 << 16))
+        }
+    }
 }
 
 impl<'a> Transaction<'a> {
@@ -54,6 +68,19 @@ impl<'a> Transaction<'a> {
     #[inline(always)]
     pub fn get_wraps(&self) -> usize {
         self.loaded_vals >> 16
+    }
+
+    /// Returns true is the usize passed matches the value
+    /// held by the transaction
+    #[inline(always)]
+    pub fn matches(&self, val: usize) -> bool {
+        self.loaded_vals == val
+    }
+
+    /// Returns true if the values passed in matches the previous wrap-around of the Transaction
+    #[inline(always)]
+    pub fn matches_previous(&self, val: usize) -> bool {
+        (self.loaded_vals - (1 << 16)) == val
     }
 
     pub fn commit(self, by: u16, ord: Ordering) -> Option<Transaction<'a>> {

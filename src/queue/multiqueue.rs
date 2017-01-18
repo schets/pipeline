@@ -53,22 +53,29 @@ pub struct MultiWriter<T> {
 impl<T> MultiQueue<T> {
 
     pub fn push_multi(&self, val: T) -> Result<(), T> {
-        let mut chead_transaction = self.head.load_transaction(Relaxed);
+        let mut transaction = self.head.load_transaction(Relaxed);
 
         // This esnures that metadata about the cursor group is in cache
         self.tail.prefetch_metadata();
         unsafe {
             loop {
+                let tail_cache = self.tail_cache.load(Acquire);
+                if transaction.matches_previous(tail_cache) {
+                    if transaction.matches_previous(self.reload_tail_multi(tail_cache)) {
+                        return Err(val);
+                    }
+                }
                 // This isize conversion here helps performance on intel
                 // since many (all?) 16-bit register ops incur a 3-cycle decoding penalty
                 // The math works out anyways and the compiler can do it well
-                let chead = chead_transaction.get() as isize;
+                let chead = transaction.get() as isize;
                 let write_cell = &mut *self.data.offset(chead);
-                match chead_transaction.commit(1, Relaxed) {
-                    Some(new_transaction) => chead_transaction = new_transaction,
+                let wrap_valid_tag = transaction.get_wraps().wrapping_add(1);
+                match transaction.commit(1, Relaxed) {
+                    Some(new_transaction) => transaction = new_transaction,
                     None => {
                         ptr::write(&mut write_cell.val, val);
-                        write_cell.wraps.store(true, Release);
+                        write_cell.wraps.store(wrap_valid_tag, Release);
                         return Ok(());
                     }
                 }
@@ -81,12 +88,21 @@ impl<T> MultiQueue<T> {
         let chead = transaction.get() as isize;
         self.tail.prefetch_metadata();
         unsafe {
+            if transaction.matches_previous(self.tail_cache.load(Relaxed)) {
+                if transaction.matches_previous(self.reload_tail_single()) {
+                    return Err(val);
+                }
+            }
             let write_cell = &mut *self.data.offset(chead);
             ptr::write(&mut write_cell.val, val);
-            write_cell.wraps.store(true, Release);
+            let wrap_valid_tag = transaction.get_wraps().wrapping_add(1);
+            write_cell.wraps.store(wrap_valid_tag, Release);
             transaction.commit_direct(1, Relaxed);
             Ok(())
         }
+
+        // Might consider letting the queue update the tail cache here preemptively
+        // so it doesn't waste time before sending a message to do so
     }
 
     pub fn pop(&self, reader: &Reader) -> Option<T> {
@@ -102,18 +118,38 @@ impl<T> MultiQueue<T> {
                 maybe_acquire_fence();
                 let rval = ptr::read(&read_cell.val);
                 match ctail_attempt.commit_attempt(1, Release) {
-                    Some(new_attempt) => ctail_attempt = new_transaction,
-                    None => {
-                        return Some(rval);
-                    }
+                    Some(new_attempt) => ctail_attempt = new_attempt,
+                    None => return Some(rval),
                 }
             }
         }
     }
 
-    fn reload_tail_single(&self, cur_head: u16) {
-        let max_diff_from_head = self.tail.get_max_diff(cur_head);
-        
+    fn reload_tail_multi(&self, tail_cache: usize) -> usize {
+        // This shows how far behind from head the reader is
+        if let Some(max_diff_from_head) = self.tail.get_max_diff(self.head.load(Relaxed)) {
+            let current_tail = self.head.get_previous(max_diff_from_head);
+            match self.tail_cache.compare_exchange(tail_cache, current_tail,
+                                                   Relaxed, Acquire) {
+                Ok(val) => val,
+                Err(val) => val,
+            }
+        }
+        else {
+            // Should assert false or something
+            self.tail_cache.load(Acquire)
+        }
+    }
+
+    fn reload_tail_single(&self) -> usize {
+        if let Some(max_diff_from_head) = self.tail.get_max_diff(self.head.load(Relaxed)) {
+            let current_tail = self.head.get_previous(max_diff_from_head);
+            self.tail_cache.store(current_tail, Relaxed);
+            current_tail
+        } else {
+            // Needs to assert(false) here or something
+            self.tail_cache.load(Acquire)
+        }
     }
 }
 
