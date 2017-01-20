@@ -17,7 +17,7 @@ mod CanConsume {
               target_arch = "x64_64",
               target_arch = "aarch64",
               target_arch = "arm")))]
-mod CanConsume { 
+mod CanConsume {
     use std::sync::atomic::Ordering;
     pub const Consume: Ordering = Ordering::Acquire;
 }

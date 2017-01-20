@@ -1,4 +1,4 @@
 
-mod cursor;
+mod read_cursor;
 
 pub mod multiqueue;

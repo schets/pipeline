@@ -1,5 +1,6 @@
 
 use std::cell::Cell;
+use std::mem;
 use std::ptr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, fence};
@@ -8,7 +9,7 @@ use std::sync::atomic::Ordering::{Relaxed, Acquire, Release};
 use util::countedu16::CountedU16;
 use util::maybe_acquire::{maybe_acquire_fence, MAYBE_ACQUIRE};
 
-use queue::cursor::{Cursor, Reader};
+use queue::read_cursor::{ReadCursor, Reader};
 
 #[derive(Clone, Copy)]
 enum QueueState {
@@ -38,7 +39,7 @@ struct MultiQueue<T> {
     // to reduce the # of distinct cache lines read when getting an item
     // The tail itself is rarely modified, making it a suitable candidate
     // to be in the shared space
-    tail: Cursor,
+    tail: ReadCursor,
     data: *mut QueueEntry<T>,
     capacity: isize,
     backlog_check: isize,
@@ -50,7 +51,25 @@ pub struct MultiWriter<T> {
     state: Cell<QueueState>,
 }
 
+/*
+pub struct MultiReader<'a, T> {
+    queue: Arc<MultiQueue<T>>,
+    reader: &'a Reader,
+    state: Cell<QueueState>,
+}*/
+
 impl<T> MultiQueue<T> {
+    /*
+    pub fn new(capacity: u16) -> (MultiWriter<T>, MultiReader<T>) {
+        let queuedat: *mut QueueEntry<T>;
+        unsafe {
+            let alloc = allocate(capacity * mem::size_of::<T>(), mem::align_of::<T>());
+            queuedat = mem::transmute(alloc);
+            for i in 0..capacity as isize {
+                let elem = &*queuedat.offset(i);
+            }
+        }
+    }*/
 
     pub fn push_multi(&self, val: T) -> Result<(), T> {
         let mut transaction = self.head.load_transaction(Relaxed);
@@ -129,14 +148,11 @@ impl<T> MultiQueue<T> {
         // This shows how far behind from head the reader is
         if let Some(max_diff_from_head) = self.tail.get_max_diff(self.head.load(Relaxed)) {
             let current_tail = self.head.get_previous(max_diff_from_head);
-            match self.tail_cache.compare_exchange(tail_cache, current_tail,
-                                                   Relaxed, Acquire) {
+            match self.tail_cache.compare_exchange(tail_cache, current_tail, Relaxed, Acquire) {
                 Ok(val) => val,
                 Err(val) => val,
             }
-        }
-        else {
-            // Should assert false or something
+        } else {
             self.tail_cache.load(Acquire)
         }
     }
@@ -147,14 +163,15 @@ impl<T> MultiQueue<T> {
             self.tail_cache.store(current_tail, Relaxed);
             current_tail
         } else {
-            // Needs to assert(false) here or something
-            self.tail_cache.load(Acquire)
+            // If this assert fires, memory has been corrupted
+            assert!(false,
+                    "The write head got ran over by consumers in isngle writer mode");
+            0
         }
     }
 }
 
 impl<T> MultiWriter<T> {
-
     pub fn push(&self, val: T) -> Result<(), T> {
         match self.state.get() {
             QueueState::Single => self.queue.push_single(val),
@@ -166,8 +183,7 @@ impl<T> MultiWriter<T> {
                     fence(Acquire);
                     self.state.set(QueueState::Single);
                     self.queue.push_single(val)
-                }
-                else {
+                } else {
                     self.queue.push_multi(val)
                 }
             }

@@ -14,6 +14,7 @@ There are also some new features that as far as I know don't exist in LMAX disru
     Event processors will get bunched together onto a single thread until load requires that event handlers resplit.
   * Automatic sharding: Event handlers will be able to split into distinct handlers on different thread when the load is too high. Similarly, when demand sufficiently decreases, split event-processors will be recombined.
   * Futures: This library will be able to represent results using futures, so it can easily operate with the rest of the ecosystem.
+  * Cheap Lockless Memory Management: For memory which is only referenced by event processors, this library will provide extremely cheap methods for managing it (reads are free!) albeit at the cost of lower free throughput
 
 Here's some poor ascii art of what I mean by multi consumer:
 
