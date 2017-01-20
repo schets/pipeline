@@ -11,58 +11,51 @@ use crossbeam::scope;
 use std::sync::atomic::{AtomicUsize, Ordering, fence};
 use std::sync::Barrier;
 
-#[inline(never)]
-fn waste_50_ns(val: &AtomicUsize) {
-    val.store(0, Ordering::Release);
-    fence(Ordering::SeqCst);
-}
-
-fn recv(bar: &Barrier, reader: MultiReader<Option<u64>>) {
+fn recv(bar: &Barrier, reader: MultiReader<Option<u64>>) -> u64 {
     bar.wait();
-    let mut v = Vec::with_capacity(100000);
+    let start = precise_time_ns();
+    let mut cur = 0; 
     loop {
         if let Some(popped) = reader.pop() {
             match popped {
                 None => break,
                 Some(pushed) => {
-                    let current_time = precise_time_ns();
-                    if (current_time >= pushed) {
-                        v.push(current_time - pushed);
+                    if (cur != pushed) {
+                        panic!("Dang");
                     }
+                    cur += 1;
                 }
             }
         }
     }
-    for val in v {
-         println!("{}", val);
-    }
+
+    precise_time_ns() - start
 }
 
-fn Send(bar: &Barrier, writer: MultiWriter<Option<u64>>, num_push: usize, num_us: usize) {
+fn Send(bar: &Barrier, writer: MultiWriter<Option<u64>>, num_push: usize) {
     bar.wait();
-    let val: AtomicUsize = AtomicUsize::new(0);
-    for _ in 0..num_push {
+    for i in 0..num_push as u64 {
         loop {
-            let topush = Some(precise_time_ns());
+            let topush = Some(i);
             if let Ok(_) =  writer.push(topush) {
                 break;
             }
-        }
-        for _ in 0..(num_us*20) {
-            waste_50_ns(&val);
         }
     }
     writer.push(None);
 }
 
 fn main() {
+    let num_do = 100000;
     let (writer, reader) = multiqueue(20000);
     let bar = Barrier::new(2);
     let bref = &bar;
     scope(|scope| {
         scope.spawn(move || {
-            Send(bref, writer, 100000, 40);
+            Send(bref, writer, num_do);
         });
-        recv(bref, reader);
+        let ns_spent = recv(bref, reader) as f64;
+        let ns_per_item = ns_spent / (num_do as f64);
+        println!("Time spent doing {} push/pop pairs (without waiting on the popped result!) was {} ns per item", num_do, ns_per_item);
     });
 }
