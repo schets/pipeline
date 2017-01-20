@@ -3,5 +3,6 @@ name = "pipeline"
 version = "0.1.0"
 authors = ["Sam Schetterer <samschet@gmail.com>"]
 
-[dev-dependencies]
+[dependencies]
 crossbeam = "0.2"
+time = "*"

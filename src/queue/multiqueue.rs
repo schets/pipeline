@@ -274,10 +274,15 @@ unsafe impl<T> Send for MultiQueue<T> {}
 unsafe impl<T> Send for MultiWriter<T> {}
 unsafe impl<T> Send for MultiReader<T> {}
 
+pub fn multiqueue<T>(capacity: u16) -> (MultiWriter<T>, MultiReader<T>) {
+    MultiQueue::new(capacity)
+}
+
 #[cfg(test)]
 mod test {
 
     use super::*;
+    use super::MultiQueue;
 
     extern crate crossbeam;
     use self::crossbeam::scope;
@@ -293,7 +298,7 @@ mod test {
 
     #[test]
     fn push_pop_test() {
-        let (writer, reader) = MultiQueue::new(1);
+        let (writer, reader) = MultiQueue::<usize>::new(1);
         for _ in 0..100 {
             assert!(reader.pop().is_none());
             writer.push(1 as usize).expect("Push should succeed");
@@ -303,7 +308,7 @@ mod test {
     }
 
     fn spsc_broadcast(receivers: usize) {
-        let (writer, reader) = MultiQueue::new(10);
+        let (writer, reader) = MultiQueue::<usize>::new(10);
         let myb = Barrier::new(receivers + 1);
         let bref = &myb;
         let num_loop = 1000000;
