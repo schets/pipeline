@@ -3,9 +3,10 @@ use std::cell::Cell;
 use std::mem;
 use std::ptr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicUsize, fence};
+use std::sync::atomic::{AtomicPtr, AtomicUsize, fence};
 use std::sync::atomic::Ordering::{Relaxed, Acquire, Release};
 
+use util::alloc;
 use util::countedu16::CountedU16;
 use util::maybe_acquire::{maybe_acquire_fence, MAYBE_ACQUIRE};
 
@@ -42,7 +43,6 @@ struct MultiQueue<T> {
     tail: ReadCursor,
     data: *mut QueueEntry<T>,
     capacity: isize,
-    backlog_check: isize,
     d3: [u8; 64],
 }
 
@@ -51,30 +51,57 @@ pub struct MultiWriter<T> {
     state: Cell<QueueState>,
 }
 
-/*
-pub struct MultiReader<'a, T> {
+pub struct MultiReader<T> {
     queue: Arc<MultiQueue<T>>,
-    reader: &'a Reader,
-    state: Cell<QueueState>,
-}*/
+    reader: AtomicPtr<Reader>,
+}
 
 impl<T> MultiQueue<T> {
-    /*
     pub fn new(capacity: u16) -> (MultiWriter<T>, MultiReader<T>) {
-        let queuedat: *mut QueueEntry<T>;
+        let queuedat = alloc::allocate(capacity as usize);
         unsafe {
-            let alloc = allocate(capacity * mem::size_of::<T>(), mem::align_of::<T>());
-            queuedat = mem::transmute(alloc);
             for i in 0..capacity as isize {
-                let elem = &*queuedat.offset(i);
+                let elem: &QueueEntry<T> = &*queuedat.offset(i);
+                elem.wraps.store(0, Relaxed);
             }
         }
-    }*/
+
+        let (cursor, reader) = ReadCursor::new(capacity);
+
+        let queue = MultiQueue {
+            d1: unsafe { mem::uninitialized() },
+
+            head: CountedU16::new(0, capacity),
+            tail_cache: AtomicUsize::new(0),
+            writers: AtomicUsize::new(1),
+            d2: unsafe { mem::uninitialized() },
+
+            tail: cursor,
+            data: queuedat,
+            capacity: capacity as isize,
+
+            d3: unsafe { mem::uninitialized() },
+        };
+
+        let qarc = Arc::new(queue);
+
+        let mwriter = MultiWriter {
+            queue: qarc.clone(),
+            state: Cell::new(QueueState::Single),
+        };
+
+        let mreader = MultiReader {
+            queue: qarc,
+            reader: reader,
+        };
+
+        (mwriter, mreader)
+    }
 
     pub fn push_multi(&self, val: T) -> Result<(), T> {
         let mut transaction = self.head.load_transaction(Relaxed);
 
-        // This esnures that metadata about the cursor group is in cache
+        // This ensures that metadata about the cursor group is in cache
         self.tail.prefetch_metadata();
         unsafe {
             loop {
@@ -146,7 +173,7 @@ impl<T> MultiQueue<T> {
 
     fn reload_tail_multi(&self, tail_cache: usize) -> usize {
         // This shows how far behind from head the reader is
-        if let Some(max_diff_from_head) = self.tail.get_max_diff(self.head.load(Relaxed)) {
+        if let Some(max_diff_from_head) = self.tail.get_max_diff(self.head.load_count(Relaxed)) {
             let current_tail = self.head.get_previous(max_diff_from_head);
             match self.tail_cache.compare_exchange(tail_cache, current_tail, Relaxed, Acquire) {
                 Ok(val) => val,
@@ -158,7 +185,7 @@ impl<T> MultiQueue<T> {
     }
 
     fn reload_tail_single(&self) -> usize {
-        if let Some(max_diff_from_head) = self.tail.get_max_diff(self.head.load(Relaxed)) {
+        if let Some(max_diff_from_head) = self.tail.get_max_diff(self.head.load_count(Relaxed)) {
             let current_tail = self.head.get_previous(max_diff_from_head);
             self.tail_cache.store(current_tail, Relaxed);
             current_tail
@@ -191,6 +218,19 @@ impl<T> MultiWriter<T> {
     }
 }
 
+impl<T> MultiReader<T> {
+    pub fn pop(&self) -> Option<T> {
+        unsafe { self.queue.pop(&*self.reader.load(Relaxed)) }
+    }
+
+    pub fn add_reader(&self) -> MultiReader<T> {
+        MultiReader {
+            queue: self.queue.clone(),
+            reader: unsafe { self.queue.tail.add_reader(&*self.reader.load(Relaxed)) },
+        }
+    }
+}
+
 impl<T> Clone for MultiWriter<T> {
     fn clone(&self) -> MultiWriter<T> {
         self.state.set(QueueState::Multi);
@@ -203,12 +243,116 @@ impl<T> Clone for MultiWriter<T> {
     }
 }
 
+impl<T> Clone for MultiReader<T> {
+    fn clone(&self) -> MultiReader<T> {
+        let reader = self.reader.load(Relaxed);
+        let rval = MultiReader {
+            queue: self.queue.clone(),
+            reader: AtomicPtr::new(reader),
+        };
+        unsafe {
+            (*reader).dup_consumer();
+        }
+        rval
+    }
+}
+
 impl<T> Drop for MultiWriter<T> {
     fn drop(&mut self) {
         self.queue.writers.fetch_sub(1, Release);
     }
 }
 
+impl<T> Drop for MultiReader<T> {
+    fn drop(&mut self) {
+        unsafe { (*self.reader.load(Relaxed)).remove_consumer() }
+    }
+}
+
 unsafe impl<T> Sync for MultiQueue<T> {}
 unsafe impl<T> Send for MultiQueue<T> {}
 unsafe impl<T> Send for MultiWriter<T> {}
+unsafe impl<T> Send for MultiReader<T> {}
+
+#[cfg(test)]
+mod test {
+
+    use super::*;
+
+    extern crate crossbeam;
+    use self::crossbeam::scope;
+
+    use std::sync::atomic::Ordering::*;
+
+    use std::sync::Barrier;
+
+    #[test]
+    fn build_queue() {
+        let _ = MultiQueue::<usize>::new(10);
+    }
+
+    #[test]
+    fn push_pop_test() {
+        let (writer, reader) = MultiQueue::new(1);
+        for _ in 0..100 {
+            assert!(reader.pop().is_none());
+            writer.push(1 as usize).expect("Push should succeed");
+            assert!(writer.push(1).is_err());
+            assert_eq!(1, reader.pop().unwrap());
+        }
+    }
+
+    fn spsc_broadcast(receivers: usize) {
+        let (writer, reader) = MultiQueue::new(10);
+        let myb = Barrier::new(receivers + 1);
+        let bref = &myb;
+        let num_loop = 1000000;
+        scope(|scope| {
+            scope.spawn(move || {
+                bref.wait();
+                'outer: for i in 0..num_loop {
+                    loop {
+                        if writer.push(i).is_ok() {
+                            break;
+                        }
+                    }
+                }
+            });
+            for i in 0..(receivers - 1) {
+                let this_reader = reader.add_reader();
+                scope.spawn(move || {
+                    bref.wait();
+                    'outer: for i in 0..num_loop {
+                        loop {
+                            if let Some(val) = this_reader.pop() {
+                                assert_eq!(i, val);
+                                break;
+                            }
+                        }
+                    }
+                });
+            }
+            bref.wait();
+            'outer: for i in 0..num_loop {
+                loop {
+                    if let Some(val) = reader.pop() {
+                        assert_eq!(i, val);
+                        break;
+                    }
+                }
+            }
+        });
+        assert!(reader.pop().is_none());
+    }
+
+    #[test]
+    fn test_spsc() {
+        spsc_broadcast(1);
+    }
+
+    #[test]
+    fn test_spsc_broadcast() {
+        spsc_broadcast(3);
+    }
+
+}

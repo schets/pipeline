@@ -3,9 +3,5 @@ name = "pipeline"
 version = "0.1.0"
 authors = ["Sam Schetterer <samschet@gmail.com>"]
 
-[dependencies]
-crossbeam = "0.2"
-stable-heap = "0.1.0"
-
 [dev-dependencies]
 crossbeam = "0.2"

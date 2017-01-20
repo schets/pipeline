@@ -73,7 +73,7 @@ impl CountedU16 {
             ((lower_half - by) as usize) + upper_half
         } else {
             let extra = (by - lower_half) as usize;
-            (self.wrap - extra) + (upper_half - (1 << 16))
+            (self.wrap - extra) + (upper_half.wrapping_sub(1 << 16))
         }
     }
 }
@@ -99,7 +99,7 @@ impl<'a> Transaction<'a> {
     /// Returns true if the values passed in matches the previous wrap-around of the Transaction
     #[inline(always)]
     pub fn matches_previous(&self, val: usize) -> bool {
-        (self.loaded_vals - (1 << 16)) == val
+        self.loaded_vals.wrapping_sub(1 << 16) == val
     }
 
     pub fn commit(self, by: u16, ord: Ordering) -> Option<Transaction<'a>> {
@@ -146,7 +146,6 @@ mod tests {
     use super::*;
 
     extern crate crossbeam;
-
     use self::crossbeam::scope;
 
     use std::sync::atomic::Ordering::*;

@@ -95,6 +95,17 @@ impl Reader {
     pub fn load_nread(&self, ord: Ordering) -> usize {
         self.pos_data.load_count(ord)
     }
+
+    pub fn dup_consumer(&self) {
+        self.state.set(ReaderState::Multi);
+        self.num_consumers.fetch_add(1, Ordering::SeqCst);
+    }
+
+    pub fn remove_consumer(&self) {
+        self.num_consumers.fetch_sub(1, Ordering::SeqCst);
+
+        // Code to drop receiver for real here if is needed
+    }
 }
 
 impl ReaderGroup {
@@ -132,8 +143,7 @@ impl ReaderGroup {
         (new_group, AtomicPtr::new(new_reader))
     }
 
-    pub fn get_max_diff(&self, _cur_writer: u16) -> Option<u16> {
-        let cur_writer = _cur_writer as usize;
+    pub fn get_max_diff(&self, cur_writer: usize) -> Option<u16> {
         let mut max_diff: usize = 0;
         unsafe {
             for i in 0..self.n_readers as isize {
@@ -145,10 +155,11 @@ impl ReaderGroup {
                 if diff > (::std::u16::MAX as usize) {
                     return None;
                 }
-                max_diff = if diff > max_diff { diff } else { max_diff }
+                max_diff = if diff > max_diff { diff } else { max_diff };
             }
         }
         maybe_acquire_fence();
+        assert!(max_diff <= (::std::u16::MAX as usize));
         Some(max_diff as u16)
     }
 }
@@ -171,7 +182,7 @@ impl ReadCursor {
     }
 
     #[inline(always)]
-    pub fn get_max_diff(&self, cur_writer: u16) -> Option<u16> {
+    pub fn get_max_diff(&self, cur_writer: usize) -> Option<u16> {
         unsafe {
             let rg = &*self.readers.load(Consume);
             rg.get_max_diff(cur_writer)
@@ -190,7 +201,7 @@ impl ReadCursor {
                 let wrap = reader.pos_data.wrap_at();
                 let (new_group, new_reader) = current_group.add_reader(raw, wrap);
                 match self.readers
-                    .compare_exchange(current_ptr, new_group, Ordering::Release, Consume) {
+                    .compare_exchange(current_ptr, new_group, Ordering::SeqCst, Ordering::SeqCst) {
                     Ok(_) => return new_reader,
                     Err(val) => current_ptr = val,
                 }
