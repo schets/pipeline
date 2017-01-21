@@ -159,6 +159,7 @@ impl ReaderGroup {
             }
         }
         maybe_acquire_fence();
+
         assert!(max_diff <= (::std::u16::MAX as usize));
         Some(max_diff as u16)
     }
@@ -183,16 +184,31 @@ impl ReadCursor {
 
     #[inline(always)]
     pub fn get_max_diff(&self, cur_writer: usize) -> Option<u16> {
-        unsafe {
-            let rg = &*self.readers.load(Consume);
-            rg.get_max_diff(cur_writer)
+        loop {
+            unsafe {
+                let first_ptr = self.readers.load(Consume);
+                let rg = &*first_ptr;
+                let rval = rg.get_max_diff(cur_writer);
+                // This check ensures that the pointer hasn't changed
+                // We must first read the diff, *and then* check the pointer
+                // for changes. This is extremely similar to the seqlock except
+                // with the pointer as the sequence lock
+                // We don't need another acquire fence here sincea the
+                // relevant loads in get_max_diff are going to ordered
+                // before all loads after the function exit, and also
+                // ordered after the original pointer load
+                let second_ptr = self.readers.load(Ordering::Relaxed);
+                if second_ptr == first_ptr {
+                    return rval;
+                }
+            }
         }
     }
 
     pub fn add_reader(&self, reader: &Reader) -> AtomicPtr<Reader> {
-        // This leaks extremely badly here.
-        // Freeing during runtime will probably use the memory management system
-        // Freeing before could just free if the server hasn't been started
+        // There's no fundamental reason this needs to leak, 
+        // I just haven't implemented the memory management yet.
+        // It's not too hard since we can track readers and writers active
         let mut current_ptr = self.readers.load(Consume);
         loop {
             unsafe {
@@ -202,7 +218,10 @@ impl ReadCursor {
                 let (new_group, new_reader) = current_group.add_reader(raw, wrap);
                 match self.readers
                     .compare_exchange(current_ptr, new_group, Ordering::SeqCst, Ordering::SeqCst) {
-                    Ok(_) => return new_reader,
+                    Ok(_) => {
+                        fence(Ordering::SeqCst);
+                        return new_reader
+                    },
                     Err(val) => current_ptr = val,
                 }
             }
