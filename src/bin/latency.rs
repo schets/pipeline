@@ -4,12 +4,16 @@ extern crate time;
 
 use pipeline::queue::multiqueue::{MultiReader, MultiWriter, multiqueue};
 
-use time::precise_time_ns;
-
 use crossbeam::scope;
 
 use std::sync::atomic::{AtomicUsize, Ordering, fence};
 use std::sync::Barrier;
+
+//prevent any inlining shenanigans
+#[inline(never)]
+fn precise_time_ns() -> u64 {
+    time::precise_time_ns()
+}
 
 #[inline(never)]
 fn waste_50_ns(val: &AtomicUsize) {
@@ -18,6 +22,18 @@ fn waste_50_ns(val: &AtomicUsize) {
 }
 
 fn recv(bar: &Barrier, reader: MultiReader<Option<u64>>) {
+    let mut total_time = 0;
+    let mut succ = 0;
+    let tries = 10000;
+    for _ in 0..tries {
+        let start = precise_time_ns();
+        let end = precise_time_ns();
+        if (end >= start) {
+            succ += 1;
+            total_time += (end - start);
+        }
+    }
+    let to_subtract = total_time / succ;
     bar.wait();
     let mut v = Vec::with_capacity(100000);
     loop {
@@ -27,7 +43,10 @@ fn recv(bar: &Barrier, reader: MultiReader<Option<u64>>) {
                 Some(pushed) => {
                     let current_time = precise_time_ns();
                     if (current_time >= pushed) {
-                        v.push(current_time - pushed);
+                        let diff = current_time - pushed;
+                        if (diff > to_subtract) {
+                            v.push(diff - to_subtract);
+                        }
                     }
                 }
             }
